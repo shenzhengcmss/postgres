@@ -61,6 +61,7 @@
 #include "catalog/pg_ts_template.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_user_mapping.h"
+#include "catalog/pg_user_status.h"
 #include "commands/comment.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
@@ -180,6 +181,7 @@ static const Oid object_classes[] = {
 	PublicationRelationId,		/* OCLASS_PUBLICATION */
 	PublicationRelRelationId,	/* OCLASS_PUBLICATION_REL */
 	SubscriptionRelationId,		/* OCLASS_SUBSCRIPTION */
+	UserStatusRelationId,           /* OCLASS_USER_STATUS */
 	TransformRelationId			/* OCLASS_TRANSFORM */
 };
 
@@ -2877,6 +2879,9 @@ getObjectClass(const ObjectAddress *object)
 
 		case SubscriptionRelationId:
 			return OCLASS_SUBSCRIPTION;
+			
+		case UserStatusRelationId:
+			return OCLASS_USER_STATUS;
 
 		case TransformRelationId:
 			return OCLASS_TRANSFORM;

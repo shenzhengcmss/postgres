@@ -66,6 +66,7 @@
 #include "catalog/pg_subscription_rel.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_transform.h"
+#include "catalog/pg_user_status.h"
 #include "catalog/pg_ts_config.h"
 #include "catalog/pg_ts_config_map.h"
 #include "catalog/pg_ts_dict.h"
@@ -739,6 +740,17 @@ static const struct cachedesc cacheinfo[] = {
 		},
 		32
 	},
+	{UserStatusRelationId,     /* USERSTATUSROLEID */
+                UserStatusIndexId,
+                1,
+                {
+                        Anum_pg_user_status_roloid,
+                        0,
+                        0,
+                        0
+                },
+                128
+        },
 	{StatisticExtDataRelationId,	/* STATEXTDATASTXOID */
 		StatisticExtDataStxoidIndexId,
 		1,
