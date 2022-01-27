@@ -60,6 +60,7 @@ OBJS = \
 	user.o \
 	vacuum.o \
 	variable.o \
+	user_failed_control.o \
 	view.o
 
 include $(top_srcdir)/src/backend/common.mk

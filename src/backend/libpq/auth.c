@@ -40,7 +40,7 @@
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
-
+#include "commands/user_failed_control.h"
 /*----------------------------------------------------------------
  * Global authentication functions
  *----------------------------------------------------------------
@@ -653,6 +653,38 @@ ClientAuthentication(Port *port)
 #else
 		Assert(false);
 #endif
+	}
+
+	if (port->database_name != NULL) {
+		InitLoginControl();
+		char details[PGAUDIT_MAXLENGTH] = {0};
+		if (IsRoleExist(port->user_name) && GetRoleOid(port->user_name) != INITIAL_USER_ID) {
+			Oid roleid = GetRoleOid(port->user_name);
+			USER_STATUS rolestatus;
+			rolestatus = GetAccountLockedStatusFromHashTable(roleid);
+
+			if (UNLOCK_STATUS != rolestatus) {
+				//errno_t errorno = EOK;
+				bool unlocked = false;
+				unlocked = UnlockAccountToHashTable(roleid, false, false);
+				if (!unlocked && status != STATUS_EOF) { 
+					pg_snprintf(details,
+								PGAUDIT_MAXLENGTH,
+								"login db(%s)failed,the account(%s)has been locked",
+								port->database_name,
+								port->user_name);
+					//securec_check_ss(errorno, "\0", "\0");
+					/* Show locked errror messages when the account has been locked. */
+					ereport(FATAL,
+						(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION), errmsg("The account has been locked.")));
+				} else if (status == STATUS_OK) {
+					(void)UnlockAccountToHashTable(roleid, false, true);
+				}
+			}
+			if (status == STATUS_ERROR) {
+				UpdateFailCountToHashTable(roleid, 1, false);
+			}
+		}
 	}
 
 	if (ClientAuthentication_hook)

@@ -108,7 +108,7 @@
 #include "utils/inval.h"
 #include "utils/varlena.h"
 #include "utils/xml.h"
-
+#include "commands/user_failed_control.h"
 #ifndef PG_KRB_SRVTAB
 #define PG_KRB_SRVTAB ""
 #endif
@@ -3540,6 +3540,16 @@ static struct config_int ConfigureNamesInt[] =
 		check_client_connection_check_interval, NULL, NULL
 	},
 
+	{
+		{"failed_login_attempts", PGC_SIGHUP, CONN_AUTH_AUTH,
+			gettext_noop("max number of login attempts."),
+			NULL
+		},
+		&failed_login_attempts,
+		0, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, 0, 0, 0, NULL, NULL, NULL
@@ -3806,6 +3816,17 @@ static struct config_real ConfigureNamesReal[] =
 		},
 		&log_xact_sample_rate,
 		0.0, 0.0, 1.0,
+		NULL, NULL, NULL
+	},
+	
+	{
+		{"password_lock_time", PGC_SIGHUP, CONN_AUTH_AUTH,
+			gettext_noop("password lock time."),
+			NULL,
+			GUC_UNIT_DAY
+		},
+		&password_lock_time,
+		1.0, 0.0, 3650.0,
 		NULL, NULL, NULL
 	},
 

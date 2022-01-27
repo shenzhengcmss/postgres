@@ -225,6 +225,8 @@ typedef enum
 #define GUC_UNIT_MS			   0x10000	/* value is in milliseconds */
 #define GUC_UNIT_S			   0x20000	/* value is in seconds */
 #define GUC_UNIT_MIN		   0x30000	/* value is in minutes */
+#define GUC_UNIT_HOUR 0x50000 /* value is in hour */
+#define GUC_UNIT_DAY 0x60000  /* value is in day */
 #define GUC_UNIT_TIME		   0xF0000	/* mask for time-related units */
 
 #define GUC_EXPLAIN			  0x100000	/* include in explain */
