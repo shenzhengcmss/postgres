@@ -1112,6 +1112,7 @@ IndexScanOK(CatCache *cache, ScanKey cur_skey)
 		case AUTHOID:
 		case AUTHMEMMEMROLE:
 		case DATABASEOID:
+		case USERSTATUSROLEID:
 
 			/*
 			 * Protect authentication lookups occurring before relcache has

@@ -37,6 +37,8 @@
 #include "utils/fmgroids.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
+#include "catalog/pg_user_status.h"
+#include "commands/user_failed_control.h"
 
 /* Potentially set by pg_upgrade_support functions */
 Oid			binary_upgrade_next_pg_authid_oid = InvalidOid;
@@ -515,6 +517,47 @@ CreateRole(ParseState *pstate, CreateRoleStmt *stmt)
 	 * Close pg_authid, but keep lock till commit.
 	 */
 	table_close(pg_authid_rel, NoLock);
+	Relation pg_user_status_rel = NULL;
+	/* Insert new record in the pg_user_status table */
+	pg_user_status_rel = table_open(UserStatusRelationId, RowExclusiveLock);
+	if (RelationIsValid(pg_user_status_rel)) {
+		int isexpired = 0;
+    	tuple = NULL;
+    	TupleDesc pg_user_status_dsc = NULL;
+    	Datum pg_user_status_record[Natts_pg_user_status];
+    	bool pg_user_status_record_nulls[Natts_pg_user_status] = {false};
+
+    	memset(pg_user_status_record,  0, sizeof(pg_user_status_record));
+    	memset(pg_user_status_record_nulls,
+        false,
+        sizeof(pg_user_status_record_nulls));
+
+    	tuple = SearchSysCache1(USERSTATUSROLEID, ObjectIdGetDatum(roleid));
+    	if (!HeapTupleIsValid(tuple)) {
+      		const char* currentTime = NULL;
+      		TimestampTz nowTime = GetCurrentTimestamp();
+      		HeapTuple new_tuple = NULL;
+      		pg_user_status_dsc = RelationGetDescr(pg_user_status_rel);
+
+      		currentTime = timestamptz_to_str(nowTime);
+      		pg_user_status_record[Anum_pg_user_status_locktime - 1] = DirectFunctionCall3(
+          	timestamptz_in, CStringGetDatum(currentTime), ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+
+      		pg_user_status_record[Anum_pg_user_status_roloid - 1] = ObjectIdGetDatum(roleid);
+			pg_user_status_record[Anum_pg_user_status_failcount - 1] = Int32GetDatum(0);
+			pg_user_status_record[Anum_pg_user_status_rolstatus - 1] = Int16GetDatum(UNLOCK_STATUS);
+			pg_user_status_record[Anum_pg_user_status_passwordexpired - 1] =
+			  Int16GetDatum(isexpired ? EXPIRED_STATUS : UNEXPIRED_STATUS);
+			new_tuple = heap_form_tuple(pg_user_status_dsc, pg_user_status_record, pg_user_status_record_nulls);
+			CatalogTupleInsert(pg_user_status_rel,new_tuple);
+			heap_freetuple(new_tuple);
+			table_close(pg_user_status_rel,NoLock);
+	    } else {
+			ReleaseSysCache(tuple);
+	    }
+	} else {
+	    ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("the relation pg_user_status is invalid")));
+	}
 
 	return roleid;
 }
@@ -817,6 +860,11 @@ AlterRole(AlterRoleStmt *stmt)
 	{
 		new_record[Anum_pg_authid_rolcanlogin - 1] = BoolGetDatum(canlogin > 0);
 		new_record_repl[Anum_pg_authid_rolcanlogin - 1] = true;
+		if (RecoveryInProgress() == false) {
+			TryUnlockAccount(roleid, true, false);
+		} else {
+			UnlockAccountToHashTable(roleid, true, false);
+		}
 	}
 
 	if (isreplication >= 0)
@@ -988,7 +1036,36 @@ AlterRoleSet(AlterRoleSetStmt *stmt)
 	return roleid;
 }
 
+/*
+ * Brief			: delete all the records of roleID in pg_auth_history
+ * Description		:
+ * Notes			:
+ */
+void DropUserStatus(Oid roleID)
+{
+    if (!OidIsValid(roleID)) {
+        ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("DropUserStatus(): roleid is not valid.")));
+    }
 
+    /* get the tuple of pg_user_status */
+    Relation pg_user_status_rel = RelationIdGetRelation(UserStatusRelationId);
+
+    /* if the relation is valid, then delete the records of the role */
+    if (RelationIsValid(pg_user_status_rel)) {
+        LockRelationOid(UserStatusRelationId, RowExclusiveLock);
+        pgstat_initstats(pg_user_status_rel);
+
+        HeapTuple tuple = SearchSysCache1(USERSTATUSROLEID, PointerGetDatum(roleID));
+        if (HeapTupleIsValid(tuple)) {
+            simple_heap_delete(pg_user_status_rel, &tuple->t_self);
+            ReleaseSysCache(tuple);
+        }
+        heap_close(pg_user_status_rel, NoLock);
+    } else {
+        ereport(WARNING, (errmsg("the relation pg_user_status is invalid")));
+        return;
+    }
+}
 /*
  * DROP ROLE
  */
@@ -1136,6 +1213,8 @@ DropRole(DropRoleStmt *stmt)
 		}
 
 		systable_endscan(sscan);
+		
+		DropUserStatus(roleid);
 
 		/*
 		 * Remove any comments or security labels on this role.

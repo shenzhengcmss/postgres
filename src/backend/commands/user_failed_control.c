@@ -122,6 +122,145 @@ USER_STATUS GetAccountLockedStatusFromHashTable(Oid roleid)
     return rolestatus;
 }
 
+void FillAccountRecord(AccountLockHashEntry *account_entry, TupleDesc pg_user_status_dsc, HeapTuple tuple, 
+                    Datum *user_status_record, bool *user_status_record_repl) {
+    Datum userStatusDatum;
+    bool userStatusIsNull = false;
+    int32 failcount_in_catalog = account_entry->failcount;
+    const char* locktime_in_catalog = NULL;
+    bool catalog_superlock = false;
+    bool catalog_lock = false;
+    
+    userStatusDatum = heap_getattr(tuple, Anum_pg_user_status_failcount, pg_user_status_dsc, &userStatusIsNull);
+    if (!(userStatusIsNull || (void*)userStatusDatum == NULL)) {
+        failcount_in_catalog += DatumGetInt32(userStatusDatum);
+    }
+
+    userStatusDatum = heap_getattr(tuple, Anum_pg_user_status_rolstatus, pg_user_status_dsc, &userStatusIsNull);
+    if (!(userStatusIsNull || (void*)userStatusDatum == NULL)) {
+        if (DatumGetInt16(userStatusDatum) == SUPERLOCK_STATUS) {
+            catalog_superlock = true;
+        } else if (DatumGetInt16(userStatusDatum) == LOCK_STATUS) {
+            catalog_lock = true;
+        }
+    }
+
+    if (catalog_superlock == false) {
+        if (account_entry->rolstatus == SUPERLOCK_STATUS) {
+            locktime_in_catalog = timestamptz_to_str(account_entry->locktime);
+            user_status_record[Anum_pg_user_status_locktime - 1] = DirectFunctionCall3(
+                timestamptz_in, CStringGetDatum(locktime_in_catalog), ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+            user_status_record_repl[Anum_pg_user_status_locktime - 1] = true;
+            user_status_record[Anum_pg_user_status_rolstatus - 1] = Int16GetDatum(SUPERLOCK_STATUS);
+            user_status_record_repl[Anum_pg_user_status_rolstatus - 1] = true;
+        } else if (catalog_lock == false) {
+            if (account_entry->rolstatus == LOCK_STATUS) {
+                locktime_in_catalog = timestamptz_to_str(account_entry->locktime);
+                user_status_record[Anum_pg_user_status_locktime - 1] = DirectFunctionCall3(
+                    timestamptz_in, CStringGetDatum(locktime_in_catalog), ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+                user_status_record_repl[Anum_pg_user_status_locktime - 1] = true;
+                user_status_record[Anum_pg_user_status_rolstatus - 1] = Int16GetDatum(LOCK_STATUS);
+                user_status_record_repl[Anum_pg_user_status_rolstatus - 1] = true;
+            } else if (failed_login_attempts > 0 && 
+                failcount_in_catalog >= failed_login_attempts) {
+                /* The sum of failcount in hash table and pg_user_status > Failed_login_attempts, update rolestatus*/
+                user_status_record[Anum_pg_user_status_rolstatus - 1] = Int16GetDatum(LOCK_STATUS);
+                user_status_record_repl[Anum_pg_user_status_rolstatus - 1] = true;
+                TimestampTz nowTime = GetCurrentTimestamp();
+                locktime_in_catalog = timestamptz_to_str(nowTime);
+                user_status_record[Anum_pg_user_status_locktime - 1] = DirectFunctionCall3(
+                    timestamptz_in, CStringGetDatum(locktime_in_catalog), ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+                user_status_record_repl[Anum_pg_user_status_locktime - 1] = true;
+            }
+        }
+    }
+
+    user_status_record[Anum_pg_user_status_failcount - 1] = Int32GetDatum(failcount_in_catalog);
+    user_status_record_repl[Anum_pg_user_status_failcount - 1] = true;
+}
+
+
+void UpdateAccountInfoFromHashTable()
+{
+    AccountLockHashEntry *account_entry = NULL;
+    HASH_SEQ_STATUS hseq_status;
+
+    Relation pg_user_status_rel = NULL;
+    TupleDesc pg_user_status_dsc = NULL;
+    HeapTuple tuple = NULL;
+    HeapTuple new_tuple = NULL;
+
+    /* get tuple of pg_user_status*/
+    pg_user_status_rel = RelationIdGetRelation(UserStatusRelationId);
+    /* if the relation is valid, get the tuple of roleID*/
+    if (RelationIsValid(pg_user_status_rel)) {
+        LockRelationOid(UserStatusRelationId, RowExclusiveLock);
+        pgstat_initstats(pg_user_status_rel);
+        pg_user_status_dsc = RelationGetDescr(pg_user_status_rel);
+
+        hash_seq_init(&hseq_status, g_instance.policy_cxt.account_table);
+        while ((account_entry = (AccountLockHashEntry*)hash_seq_search(&hseq_status)) != NULL) {
+            tuple = SearchSysCache1(USERSTATUSROLEID, PointerGetDatum(account_entry->roleoid));
+            if (HeapTupleIsValid(tuple)) {
+                Datum user_status_record[Natts_pg_user_status] = {0};
+                bool user_status_record_nulls[Natts_pg_user_status] = {false};
+                bool user_status_record_repl[Natts_pg_user_status] = {false};
+                FillAccountRecord(account_entry, pg_user_status_dsc, tuple, user_status_record, user_status_record_repl);
+                new_tuple = (HeapTuple) heap_modify_tuple(
+                    tuple, pg_user_status_dsc, user_status_record, user_status_record_nulls, user_status_record_repl);
+                heap_inplace_update(pg_user_status_rel, new_tuple);
+                CacheInvalidateHeapTuple(pg_user_status_rel, tuple, new_tuple);
+                heap_freetuple(new_tuple);
+                ReleaseSysCache(tuple);
+            }
+            hash_search(g_instance.policy_cxt.account_table, &(account_entry->roleoid), HASH_REMOVE, NULL);
+        }
+        AcceptInvalidationMessages();
+        heap_close(pg_user_status_rel, NoLock);
+    }
+}
+
+/* Get the status of account. */
+USER_STATUS GetAccountLockedStatus(Oid roleID)
+{
+    uint16 status = 0;
+    Datum userStatusDatum;
+    bool userStatusIsNull = false;
+
+    if (!OidIsValid(roleID)) {
+        ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("getAccountLockedStyle: roleid is not valid.")));
+    }
+
+    if (g_instance.policy_cxt.account_table != NULL) {
+        /* Update user status info from hash table to pg_user_status table. We only update once
+         * when the first time user connect to get user lock status after dn became primary. To deal
+         * with concurrent scenarios, check hash table not null again after we get hash table lock.
+         */
+        (void)LWLockAcquire(g_instance.policy_cxt.account_table_lock, LW_EXCLUSIVE);
+        if (g_instance.policy_cxt.account_table != NULL) {
+            UpdateAccountInfoFromHashTable();
+            hash_destroy(g_instance.policy_cxt.account_table);
+            g_instance.policy_cxt.account_table = NULL;
+        }
+        LWLockRelease(g_instance.policy_cxt.account_table_lock);
+    }
+
+    HeapTuple tuple = SearchSysCache1(USERSTATUSROLEID, PointerGetDatum(roleID));
+    if (!HeapTupleIsValid(tuple)) {
+        status = UNLOCK_STATUS;
+    } else {
+        userStatusDatum = SysCacheGetAttr(USERSTATUSROLEID, tuple, Anum_pg_user_status_rolstatus, &userStatusIsNull);
+        if (!(userStatusIsNull || (void*)userStatusDatum == NULL)) {
+            status = DatumGetInt16(userStatusDatum);
+        } else {
+            status = UNLOCK_STATUS;
+        }
+        ReleaseSysCache(tuple);
+    }
+
+    return (USER_STATUS)status;
+}
+
 static bool LockAccountParaValid(Oid roleID, int extrafails, bool superlock)
 {
 #define INITUSER_OID 10
@@ -323,9 +462,9 @@ void TryLockAccount(Oid roleID, int extrafails, bool superlock)
                     lockflag = 1;
                 }
             }
-			new_tuple = (HeapTuple) heap_modify_tuple(tuple, pg_user_status_dsc, user_status_record, user_status_record_nulls, user_status_record_repl);
+						new_tuple = (HeapTuple) heap_modify_tuple(tuple, pg_user_status_dsc, user_status_record, user_status_record_nulls, user_status_record_repl);
             heap_inplace_update(pg_user_status_rel, new_tuple);
-			CacheInvalidateHeapTuple(pg_user_status_rel, tuple, new_tuple);
+						CacheInvalidateHeapTuple(pg_user_status_rel, tuple, new_tuple);
             heap_freetuple(new_tuple);
             ReleaseSysCache(tuple);
         } else {
@@ -342,6 +481,174 @@ void TryLockAccount(Oid roleID, int extrafails, bool superlock)
 
     ReportLockAccountMessage(lockflag, rolename);
 }
+
+static void UpdateUnlockAccountTuples(HeapTuple tuple, Relation rel, TupleDesc tupledesc)
+{
+    HeapTuple new_tuple = NULL;
+    Datum user_status_record[Natts_pg_user_status];
+    bool user_status_record_nulls[Natts_pg_user_status] = {false};
+    bool user_status_record_repl[Natts_pg_user_status] = {false};
+    
+    memset(user_status_record, 0, sizeof(user_status_record));
+    memset(user_status_record_nulls, 0, sizeof(user_status_record_nulls));
+    memset(user_status_record_repl,0, sizeof(user_status_record_repl));
+
+    user_status_record[Anum_pg_user_status_failcount - 1] = Int32GetDatum(0);
+    user_status_record_repl[Anum_pg_user_status_failcount - 1] = true;
+    user_status_record[Anum_pg_user_status_rolstatus - 1] = Int16GetDatum(UNLOCK_STATUS);
+    user_status_record_repl[Anum_pg_user_status_rolstatus - 1] = true;
+
+    new_tuple =
+        (HeapTuple) heap_modify_tuple(tuple, tupledesc, user_status_record, user_status_record_nulls, user_status_record_repl);
+    heap_inplace_update(rel, new_tuple);
+    heap_freetuple(new_tuple);
+}
+
+static TimestampTz GetPasswordTimeOfTuple(TimestampTz nowTime, TimestampTz* fromTime, Datum userStatusDatum, HeapTuple tuple,
+    TupleDesc pg_user_status_dsc, bool* userStatusIsNull)
+{
+    Datum fromTimeDatum;
+    Interval tspan;
+    TimestampTz lockTime = 0;
+
+    /* we transform the u_sess->attr.attr_security.Password_lock_time to days and seconds */
+    tspan.month = 0;
+    tspan.day = (int)floor(password_lock_time);
+#ifdef HAVE_INT64_TIMESTAMP
+    tspan.time =
+        (password_lock_time - tspan.day) * HOURS_PER_DAY * SECS_PER_HOUR * USECS_PER_SEC;
+#else
+    tspan.time = (password_lock_time - tspan.day) * HOURS_PER_DAY * SECS_PER_HOUR;
+#endif
+
+    /* get the fromTime */
+    fromTimeDatum = DirectFunctionCall2(timestamptz_mi_interval, TimestampGetDatum(nowTime), PointerGetDatum(&tspan));
+    *fromTime = DatumGetTimestampTz(fromTimeDatum);
+
+    userStatusDatum = heap_getattr(tuple, Anum_pg_user_status_locktime, pg_user_status_dsc, userStatusIsNull);
+    /* get the passwordtime of tuple */
+    if ((*userStatusIsNull) || (void*)userStatusDatum == NULL) {
+        lockTime = 0;
+    } else {
+        lockTime = DatumGetTimestampTz(userStatusDatum);
+    }
+
+    return lockTime;
+}
+
+
+/*
+ * Brief			: try to unlock the account
+ * Description		: if satisfied unlock conditions, delete the record of the role
+ * Notes			:
+ */
+bool TryUnlockAccount(Oid roleID, bool superunlock, bool isreset)
+{
+    Relation pg_user_status_rel = NULL;
+    TupleDesc pg_user_status_dsc = NULL;
+    TimestampTz nowTime;
+    TimestampTz fromTime;
+    TimestampTz lockTime;
+    int16 status = 0;
+    Datum userStatusDatum;
+    bool userStatusIsNull = false;
+    bool result = false;
+    bool unlockflag = 0;
+    char* rolename = NULL;
+
+    if (!OidIsValid(roleID)) {
+        ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("TryUnlockAccount(): roleid is not valid.")));
+    }
+
+#define INITUSER_OID 10
+    if (roleID == INITUSER_OID) {
+        if (superunlock) {
+            ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("Permission denied.")));
+        } else {
+            return true;
+        }
+    }
+
+    rolename = GetUserNameFromId(roleID,false);
+    /* get the tuple of pg_user_status */
+    pg_user_status_rel = RelationIdGetRelation(UserStatusRelationId);
+
+    /* if the relation is valid, get the tuple of roleID */
+    if (RelationIsValid(pg_user_status_rel)) {
+        LockRelationOid(UserStatusRelationId, RowExclusiveLock);
+        pgstat_initstats(pg_user_status_rel);
+        pg_user_status_dsc = RelationGetDescr(pg_user_status_rel);
+
+        HeapTuple tuple = SearchSysCache1(USERSTATUSROLEID, PointerGetDatum(roleID));
+
+        /* if the record is not exist, it may be already unlocked by someone else */
+        if (!HeapTupleIsValid(tuple)) {
+            ereport(WARNING, (errmsg("Invalid roleid in pg_user_status.")));
+        } else {
+            /* if super user try to unlock, just delete the tuple */
+            userStatusDatum = heap_getattr(tuple, Anum_pg_user_status_rolstatus, pg_user_status_dsc, &userStatusIsNull);
+            if (!(userStatusIsNull || (void*)userStatusDatum == NULL)) {
+                status = DatumGetInt16(userStatusDatum);
+            } else {
+                status = UNLOCK_STATUS;
+            }
+
+            if (superunlock) {
+                if (status != UNLOCK_STATUS) {
+                    UpdateUnlockAccountTuples(tuple, pg_user_status_rel, pg_user_status_dsc);
+                    result = true;
+                    unlockflag = 1;
+                }
+            } else {
+                if (status == UNLOCK_STATUS) {
+                    if (isreset) {
+                        Datum failCountDatum;
+                        int failCount = 0;
+
+                        failCountDatum =
+                            heap_getattr(tuple, Anum_pg_user_status_failcount, pg_user_status_dsc, &userStatusIsNull);
+                        if (userStatusIsNull || (void*)failCountDatum == NULL) {
+                            failCount = 0;
+                        } else {
+                            failCount = DatumGetTimestampTz(failCountDatum);
+                        }
+
+                        if (failCount > 0)
+                            UpdateUnlockAccountTuples(tuple, pg_user_status_rel, pg_user_status_dsc);
+                    }
+                    result = true;
+                } else if (status == SUPERLOCK_STATUS) {
+                    result = false;
+                } else {
+                    /* get current time */
+                    nowTime = GetCurrentTimestamp();
+                    lockTime = GetPasswordTimeOfTuple(
+                        nowTime, &fromTime, userStatusDatum, tuple, pg_user_status_dsc, &userStatusIsNull);
+                    if (lockTime < fromTime) {
+                        UpdateUnlockAccountTuples(tuple, pg_user_status_rel, pg_user_status_dsc);
+                        result = true;
+                        unlockflag = 1;
+                    } else {
+                        result = false;
+                    }
+                }
+            }
+            ReleaseSysCache(tuple);
+        }
+        AcceptInvalidationMessages();
+        (void)GetCurrentCommandId(true);
+        CommandCounterIncrement();
+        heap_close(pg_user_status_rel, RowExclusiveLock);
+        if (unlockflag) {
+            pgaudit_lock_or_unlock_user(false, rolename);
+        }
+    } else {
+        ereport(WARNING, (errmsg("the relation pg_user_status is invalid")));
+    }
+
+    return result;
+}
+
 
 
 /*

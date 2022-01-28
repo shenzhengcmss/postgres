@@ -68,5 +68,8 @@ void UpdateFailCountToHashTable(Oid roleid, int4 extrafails, bool superlock);
 bool IsRoleExist(const char* username);
 Oid GetRoleOid(const char* username);
 void InitLoginControl();
+bool TryUnlockAccount(Oid roleID, bool superunlock, bool isreset);
+void TryLockAccount(Oid roleID, int extrafails, bool superlock);
+USER_STATUS GetAccountLockedStatusFromHashTable(Oid roleid);
 #endif
 

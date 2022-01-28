@@ -779,6 +779,18 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	{
 		/* normal multiuser case */
 		Assert(MyProcPort != NULL);
+		if (in_dbname != NULL) {
+			HeapTuple	tuple;
+			Form_pg_database dbform;
+			tuple = GetDatabaseTuple(in_dbname);
+			if (!HeapTupleIsValid(tuple))
+				ereport(FATAL,
+						(errcode(ERRCODE_UNDEFINED_DATABASE),
+						 errmsg("database \"%s\" does not exist", in_dbname)));
+			dbform = (Form_pg_database) GETSTRUCT(tuple);
+			MyDatabaseId = dbform->oid;
+			MyDatabaseTableSpace = dbform->dattablespace;
+		}
 		PerformAuthentication(MyProcPort);
 		InitializeSessionUserId(username, useroid);
 		am_superuser = superuser();
